@@ -16,10 +16,13 @@ class MQTTDevice:
         self._entities = {}
         self._route_table = {}
         self._pending_states = {}
+        self._pending_retries = {}
         self._reconnect_backoff = 5
         self._max_backoff = 60
         self._connectivity_callback = None
         self._loop_callbacks = []
+        self._in_reconnect = False
+        self._last_gc = 0
 
     def unique_id(self): return self._unique_id
     def name(self): return self._name
@@ -155,7 +158,12 @@ class MQTTDevice:
                     topic_path = self._make_topic_path(entity, topic_type)
                     self._client.publish(topic_path, payload, retain=True)
             except Exception:
-                self._pending_states[key] = (entity, updates)
+                # FIX: не бесконечный ретрай — считаем попытки и выбрасываем
+                # устаревшие записи, иначе словарь растёт при каждом обрыве.
+                retries = self._pending_retries.get(key, 0) + 1
+                if retries < 5:
+                    self._pending_retries[key] = retries
+                    self._pending_states[key] = (entity, updates)
 
     def register_entity(self, entity):
         entity_state_key = self._entity_state_key(entity)
@@ -175,22 +183,29 @@ class MQTTDevice:
             self._publish_entity_state(entity)
 
     def _reconnect(self):
-        if not self._ensure_wlan():
-            time.sleep(1)
-            return False
-        try: self._client.disconnect()
-        except: pass
-        time.sleep(1)
+        # FIX: защита от рекурсии — если reconnect уже выполняется (например,
+        # из колбэка внутри цикла), не запускаем вложенный reconnect.
+        if self._in_reconnect: return False
+        self._in_reconnect = True
         try:
-            self._client.connect()
-            self._publish_online()
-            self.setup_entities()
-            self._flush_pending_states()
-            self._reconnect_backoff = 5
-            return True
-        except Exception:
-            self._reconnect_backoff = min(self._reconnect_backoff * 2, self._max_backoff)
-            return False
+            if not self._ensure_wlan():
+                time.sleep(1)
+                return False
+            try: self._client.disconnect()
+            except: pass
+            time.sleep(1)
+            try:
+                self._client.connect()
+                self._publish_online()
+                self.setup_entities()
+                self._flush_pending_states()
+                self._reconnect_backoff = 5
+                return True
+            except Exception:
+                self._reconnect_backoff = min(self._reconnect_backoff * 2, self._max_backoff)
+                return False
+        finally:
+            self._in_reconnect = False
 
     def run(self, loop_delay=0.5, timeout_ms=15000):
         '''Главный цикл с WiFi-watchdog.'''
@@ -205,12 +220,31 @@ class MQTTDevice:
         self._publish_online()
         self.setup_entities()
         error_count = 0
+        watchdog = None
+        # FIX: WDT на ESP8266 не имеет feed() и при создании сразу считает
+        # время до срабатывания — если он недоступен/некормим, лучше работать
+        # без него, чем получить детерминированную перезагрузку каждые N секунд.
         try:
-            watchdog = WDT(timeout=timeout_ms)
-        except (ValueError, TypeError):
-            watchdog = WDT()
+            wdt = WDT(timeout=timeout_ms)
+            if hasattr(wdt, 'feed'):
+                watchdog = wdt
+            else:
+                try: wdt.deinit()
+                except Exception: pass
+                print('WARN: WDT without feed() (ESP8266) — disabled')
+        except Exception as e:
+            print('WARN: WDT unavailable:', e)
 
+        last_loop = time.ticks_ms()
         while True:
+            now = time.ticks_ms()
+            # FIX: компенсация времени блокирующих операций (reconnect, sleep(1))
+            # вместо жёсткого time.sleep(loop_delay) на каждой итерации.
+            elapsed = time.ticks_diff(now, last_loop)
+            if elapsed < int(loop_delay * 1000):
+                time.sleep_ms(int(loop_delay * 1000) - elapsed)
+            last_loop = time.ticks_ms()
+
             try:
                 if watchdog: watchdog.feed()
 
@@ -235,15 +269,27 @@ class MQTTDevice:
                     self._flush_pending_states()
                 error_count = 0
 
-                try:
-                    # FIX: GC вызывается только при нехватке памяти (<10KB), чтобы избежать фризов
-                    if gc.mem_free() < 10000:
-                        gc.collect()
-                except AttributeError:
+                # FIX: периодический GC раз в ~30 секунд + экстренный при
+                # реальном дефиците памяти. Прежний порог mem_free()<10000
+                # срабатывал почти каждую итерацию: gc.collect() на ESP8266
+                # занимает сотни мс и «замораживал» сеть.
+                if time.ticks_diff(time.ticks_ms(), self._last_gc) > 30000 or gc.mem_free() < 4096:
                     gc.collect()
-                time.sleep(loop_delay)
+                    self._last_gc = time.ticks_ms()
+            except KeyboardInterrupt:
+                raise
             except Exception:
                 error_count += 1
+                if error_count >= 10:
+                    # FIX: WiFi формально есть, но MQTT-цикл стабильно падает —
+                    # гарантированный выход: чистый reset вместо тихого зависания.
+                    try:
+                        import state_manager
+                        state_manager.persist_gpio(force=True)
+                    except Exception:
+                        pass
+                    import machine
+                    machine.reset()
                 if error_count >= 3:
                     if watchdog: watchdog.feed()
                     if self._reconnect(): error_count = 0
