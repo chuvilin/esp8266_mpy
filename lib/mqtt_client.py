@@ -22,6 +22,7 @@ class MQTTClient:
         self._pid = 0
         self._last_activity = 0
         self._last_ping = 0
+        self._awaiting_pong = False
         self._will_topic = None
         self._will_payload = None
         self._will_qos = 0
@@ -96,18 +97,26 @@ class MQTTClient:
         now = time.ticks_ms()
         self._last_activity = now
         self._last_ping = now
+        self._awaiting_pong = False
 
     def _check_keepalive(self):
         if self._keepalive == 0: return
         now = time.ticks_ms()
         interval = self._keepalive * 1000
+        # FIX: PINGRESP так же является активностью — обновляем _last_activity,
+        # иначе мёртвое соединение никогда не детектировалось и цикл «оживал» вечно.
+        if time.ticks_diff(now, self._last_activity) > interval:
+            raise RuntimeError('Keepalive timeout: no traffic from broker')
         if time.ticks_diff(now, self._last_ping) > (interval * 7 // 10):
             self._ping()
             self._last_ping = now
 
     def _ping(self):
-        try: self._sock.write(b'\xC0\x00')
-        except: pass
+        try:
+            self._sock.write(b'\xC0\x00')
+            self._awaiting_pong = True
+        except Exception:
+            raise RuntimeError('PINGREQ send failed')
 
     def _close_socket(self):
         if self._sock:
@@ -224,16 +233,20 @@ class MQTTClient:
 
         self._update_activity()
         if qos == 1:
-            self._sock.setblocking(True)
+            # FIX: никогда не уходить в блокирующий режим без таймаута —
+            # на ESP8266 это вечная блокировка при «мёртвом» TCP-соединении.
+            self._sock.settimeout(5.0)
             try:
                 resp = self._read_fully(4)
                 if resp[0] != 0x40 or resp[1] != 0x02:
                     raise RuntimeError('PUBACK expected')
             except Exception:
                 self._connected = False
+                self._close_socket()
                 raise
             finally:
-                self._sock.setblocking(False)
+                if self._sock:
+                    self._sock.settimeout(0)  # вернуть неблокирующий режим
 
     def _subscribe_packet(self, topic, qos=0, retries=2):
         topic_b = topic.encode('utf-8') if isinstance(topic, str) else topic
@@ -278,21 +291,28 @@ class MQTTClient:
 
     def get_messages(self):
         if not self._connected: raise RuntimeError('MQTT not connected')
-        self._check_keepalive()
+        try:
+            self._check_keepalive()
+        except Exception:
+            # FIX: keepalive истёк / PINGREQ не ушёл — соединение считать мёртвым
+            self._connected = False
+            self._close_socket()
+            raise
         try:
             first_byte = self._sock.read(1)
         except OSError as e:
-            if e.args[0] in (11, 35): return
+            if e.args[0] in (11, 35, 110, 116): return  # EAGAIN/EINPROGRESS/ETIMEDOUT/ESRCH — просто нет данных
             self._connected = False
             self._close_socket()
             raise
         except Exception:
             self._connected = False
+            self._close_socket()
             raise
 
         if not first_byte: return
         # FIX: Временный таймаут для чтения оставшейся части пакета
-        self._sock.settimeout(1.0)
+        self._sock.settimeout(2.0)
         try:
             pkt_type = first_byte[0] & 0xF0
             rem_len = self._recv_length()
