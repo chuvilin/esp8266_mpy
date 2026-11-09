@@ -22,6 +22,7 @@ class MQTTClient:
         self._pid = 0
         self._last_activity = 0
         self._last_ping = 0
+        self._last_rx = 0
         self._awaiting_pong = False
         self._will_topic = None
         self._will_payload = None
@@ -99,15 +100,29 @@ class MQTTClient:
         self._last_ping = now
         self._awaiting_pong = False
 
+    def _update_rx(self):
+        '''Отметить входящий трафик от брокера (для keepalive-детекции).'''
+        now = time.ticks_ms()
+        self._last_rx = now
+        self._last_activity = now
+        self._last_ping = now
+        self._awaiting_pong = False
+
     def _check_keepalive(self):
         if self._keepalive == 0: return
         now = time.ticks_ms()
         interval = self._keepalive * 1000
-        # FIX: PINGRESP так же является активностью — обновляем _last_activity,
-        # иначе мёртвое соединение никогда не детектировалось и цикл «оживал» вечно.
-        if time.ticks_diff(now, self._last_activity) > interval:
+        # FIX: мёртвое TCP-соединение раньше не детектировалось вообще:
+        # локальные публикации обновляли «активность», и клиент вечно писал
+        # в никуда, не переподключаясь. Теперь отслеживаем входящий трафик
+        # отдельно и при его отсутствии превыше keepalive — разрываем связь.
+        if time.ticks_diff(now, self._last_rx) > interval + (interval >> 2):
             raise RuntimeError('Keepalive timeout: no traffic from broker')
         if time.ticks_diff(now, self._last_ping) > (interval * 7 // 10):
+            # FIX: если на прошлый PINGREQ нет ответа (PINGRESP) — соединение
+            # считать разорванным, а не зацикливать отправку пингов в void.
+            if self._awaiting_pong:
+                raise RuntimeError('Keepalive timeout: no PINGRESP')
             self._ping()
             self._last_ping = now
 
@@ -177,6 +192,7 @@ class MQTTClient:
             self._sock.settimeout(0)  # Вернуть в неблокирующий режим
         self._connected = True
         self._update_activity()
+        self._last_rx = time.ticks_ms()
 
     def disconnect(self):
         if not self._connected: return
@@ -197,13 +213,16 @@ class MQTTClient:
                 payload = ujson.dumps(payload)
             except MemoryError:
                 gc.collect()
-                # Fallback: ручная сборка без ujson
+                # Fallback: ручная сборка без ujson.
+                # ВАЖНО: payload здесь ещё dict — итерируем его напрямую
+                # (в прежней версии было payload.items() уже по перезаписанной
+                # строке — NameError/AttributeError на каждом OOM).
                 p = []
                 for k, v in payload.items():
                     if v is None: continue
-                    if isinstance(v, str): p.append(f'"{k}":"{v}"')
-                    elif isinstance(v, bool): p.append(f'"{k}":{str(v).lower()}')
-                    else: p.append(f'"{k}":{v}')
+                    if isinstance(v, str): p.append('"{}":"{}"'.format(k, v))
+                    elif isinstance(v, bool): p.append('"{}":{}'.format(k, str(v).lower()))
+                    else: p.append('"{}":{}'.format(k, v))
                 payload = '{' + ','.join(p) + '}'
 
         if isinstance(payload, str):
@@ -310,7 +329,14 @@ class MQTTClient:
             self._close_socket()
             raise
 
-        if not first_byte: return
+        if not first_byte:
+            # FIX: broker/peer закрыл соединение (FIN). Раньше это молча
+            # игнорировалось, _connected оставался True и клиент «зависал»
+            # в состоянии ложного онлайна до исчерпания heap.
+            self._connected = False
+            self._close_socket()
+            raise RuntimeError('Connection closed by broker')
+
         # FIX: Временный таймаут для чтения оставшейся части пакета
         self._sock.settimeout(2.0)
         try:
@@ -328,7 +354,9 @@ class MQTTClient:
             if self._sock:
                 self._sock.settimeout(0)
 
-        self._update_activity()
+        # FIX: входящий трафик — только он подтверждает живость соединения
+        # (отдельно от локальных публикаций, см. _check_keepalive)
+        self._update_rx()
         if pkt_type == 0x30:  # PUBLISH
             topic_len = self._decode_uint16(payload_data[:2])
             topic = payload_data[2:2+topic_len].decode('utf-8')
